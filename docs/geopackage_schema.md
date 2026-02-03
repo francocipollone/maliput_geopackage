@@ -360,3 +360,313 @@ python3 test/resources/generate_test_gpkg.py
 ```bash
 sqlite3 your_map.gpkg ".schema"
 ```
+
+---
+
+## Complete Schema Reference
+
+The following is the complete SQL schema for creating a maliput-compatible GeoPackage. This can be used as a reference or executed directly to create an empty database ready for data insertion.
+
+### Schema SQL
+
+```sql
+-- =============================================================================
+-- Maliput GeoPackage Schema v1.0
+-- 
+-- This schema defines the table structure for storing HD-map road network data
+-- compatible with the maliput road network abstraction.
+--
+-- Usage:
+--   sqlite3 my_road_network.gpkg < maliput_schema.sql
+--
+-- Or in Python:
+--   import sqlite3
+--   conn = sqlite3.connect('my_road_network.gpkg')
+--   conn.executescript(open('maliput_schema.sql').read())
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- Metadata Table
+-- Stores configuration parameters for the road network
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS maliput_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- -----------------------------------------------------------------------------
+-- Junctions Table
+-- A junction is a collection of segments that share common branch points
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS junctions (
+    junction_id TEXT PRIMARY KEY,
+    name TEXT
+);
+
+-- -----------------------------------------------------------------------------
+-- Segments Table
+-- A segment is a collection of parallel lanes within a junction
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS segments (
+    segment_id TEXT PRIMARY KEY,
+    junction_id TEXT NOT NULL,
+    name TEXT,
+    FOREIGN KEY (junction_id) REFERENCES junctions(junction_id)
+        ON DELETE CASCADE
+);
+
+-- -----------------------------------------------------------------------------
+-- Lanes Table
+-- Defines lanes with their geometric boundaries as WKT LINESTRINGZ
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS lanes (
+    lane_id TEXT PRIMARY KEY,
+    segment_id TEXT NOT NULL,
+    lane_type TEXT DEFAULT 'driving' 
+        CHECK (lane_type IN ('driving', 'shoulder', 'parking', 'biking', 'sidewalk', 'restricted')),
+    direction TEXT DEFAULT 'forward'
+        CHECK (direction IN ('forward', 'backward', 'bidirectional')),
+    left_boundary TEXT NOT NULL,   -- WKT LINESTRINGZ(x1 y1 z1, x2 y2 z2, ...)
+    right_boundary TEXT NOT NULL,  -- WKT LINESTRINGZ(x1 y1 z1, x2 y2 z2, ...)
+    FOREIGN KEY (segment_id) REFERENCES segments(segment_id)
+        ON DELETE CASCADE
+);
+
+-- -----------------------------------------------------------------------------
+-- Branch Point Lanes Table
+-- Defines how lanes connect at branch points (longitudinal connectivity)
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS branch_point_lanes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    branch_point_id TEXT NOT NULL,
+    lane_id TEXT NOT NULL,
+    side TEXT NOT NULL CHECK (side IN ('a', 'b')),
+    lane_end TEXT NOT NULL CHECK (lane_end IN ('start', 'finish')),
+    FOREIGN KEY (lane_id) REFERENCES lanes(lane_id)
+        ON DELETE CASCADE,
+    UNIQUE (branch_point_id, lane_id, lane_end)
+);
+
+-- -----------------------------------------------------------------------------
+-- Adjacent Lanes Table
+-- Defines lateral adjacency between parallel lanes (lane change connectivity)
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS adjacent_lanes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lane_id TEXT NOT NULL,
+    adjacent_lane_id TEXT NOT NULL,
+    side TEXT NOT NULL CHECK (side IN ('left', 'right')),
+    FOREIGN KEY (lane_id) REFERENCES lanes(lane_id)
+        ON DELETE CASCADE,
+    FOREIGN KEY (adjacent_lane_id) REFERENCES lanes(lane_id)
+        ON DELETE CASCADE,
+    UNIQUE (lane_id, adjacent_lane_id)
+);
+
+-- -----------------------------------------------------------------------------
+-- Indexes for Performance
+-- -----------------------------------------------------------------------------
+CREATE INDEX IF NOT EXISTS idx_segments_junction ON segments(junction_id);
+CREATE INDEX IF NOT EXISTS idx_lanes_segment ON lanes(segment_id);
+CREATE INDEX IF NOT EXISTS idx_branch_point_lanes_bp ON branch_point_lanes(branch_point_id);
+CREATE INDEX IF NOT EXISTS idx_branch_point_lanes_lane ON branch_point_lanes(lane_id);
+CREATE INDEX IF NOT EXISTS idx_adjacent_lanes_lane ON adjacent_lanes(lane_id);
+CREATE INDEX IF NOT EXISTS idx_adjacent_lanes_adjacent ON adjacent_lanes(adjacent_lane_id);
+
+-- -----------------------------------------------------------------------------
+-- Default Metadata Values
+-- These can be overwritten with actual values for your road network
+-- -----------------------------------------------------------------------------
+INSERT OR IGNORE INTO maliput_metadata (key, value) VALUES ('schema_version', '1.0');
+INSERT OR IGNORE INTO maliput_metadata (key, value) VALUES ('linear_tolerance', '0.01');
+INSERT OR IGNORE INTO maliput_metadata (key, value) VALUES ('angular_tolerance', '0.01');
+INSERT OR IGNORE INTO maliput_metadata (key, value) VALUES ('scale_length', '1.0');
+INSERT OR IGNORE INTO maliput_metadata (key, value) VALUES ('inertial_to_backend_frame_translation', '{0.0, 0.0, 0.0}');
+```
+
+---
+
+## Publishing and Distribution
+
+### Schema Provider vs Data Provider
+
+The GeoPackage workflow separates **schema definition** from **data population**:
+
+| Responsibility | Schema Provider (maliput_geopackage) | Data Provider (User) |
+|----------------|--------------------------------------|----------------------|
+| **What they provide** | Table structure, constraints, indexes | Road network content |
+| **SQL operations** | `CREATE TABLE`, `CREATE INDEX`, `CHECK` | `INSERT INTO` |
+| **Examples** | Table definitions, default metadata | Junctions, lanes, geometry |
+| **Distributed as** | `.sql` file or template `.gpkg` | Populated `.gpkg` file |
+
+**Schema Provider distributes:**
+```sql
+-- Structure (tables, constraints)
+CREATE TABLE lanes (...);
+CREATE INDEX idx_lanes_segment ON lanes(segment_id);
+
+-- Default configuration
+INSERT INTO maliput_metadata (key, value) VALUES ('linear_tolerance', '0.01');
+```
+
+**Data Provider populates:**
+```sql
+-- Their road network data
+INSERT INTO junctions (junction_id, name) VALUES ('downtown', 'Downtown Area');
+INSERT INTO lanes (lane_id, segment_id, left_boundary, right_boundary)
+VALUES ('lane_1', 'seg_1', 'LINESTRINGZ(...)', 'LINESTRINGZ(...)');
+
+-- Override defaults if needed
+UPDATE maliput_metadata SET value = '0.001' WHERE key = 'linear_tolerance';
+```
+
+This separation allows:
+- **Standardization**: All maliput GeoPackages have the same structure
+- **Validation**: Constraints catch invalid data at insertion time
+- **Tooling**: Schema can be versioned and validated independently
+- **Flexibility**: Users focus on their road network, not database design
+
+---
+
+### Schema Distribution Options
+
+#### 1. SQL File in Package
+
+Include the schema as a `.sql` file in your package:
+
+```
+maliput_geopackage/
+├── share/
+│   └── maliput_geopackage/
+│       └── schema/
+│           └── maliput_schema.sql    <-- Complete schema
+```
+
+Install via CMake:
+
+```cmake
+install(
+    FILES schema/maliput_schema.sql
+    DESTINATION share/${PROJECT_NAME}/schema
+)
+```
+
+Users can then find it:
+
+```cpp
+#include <ament_index_cpp/get_package_share_directory.hpp>
+
+std::string schema_path = ament_index_cpp::get_package_share_directory("maliput_geopackage") 
+                        + "/schema/maliput_schema.sql";
+```
+
+#### 2. Programmatic Schema Creation
+
+Provide a function that creates the schema:
+
+```cpp
+namespace maliput_geopackage {
+
+/// Creates an empty GeoPackage database with the maliput schema.
+/// @param filepath Path where the .gpkg file will be created
+/// @throws std::runtime_error if file creation fails
+void CreateEmptyGeoPackage(const std::string& filepath);
+
+}  // namespace maliput_geopackage
+```
+
+#### 3. Template GeoPackage
+
+Distribute an empty `.gpkg` file with the schema already created:
+
+```
+maliput_geopackage/
+├── share/
+│   └── maliput_geopackage/
+│       └── templates/
+│           └── empty_road_network.gpkg   <-- Empty DB with schema
+```
+
+Users copy and populate:
+
+```bash
+cp $(ros2 pkg prefix maliput_geopackage)/share/maliput_geopackage/templates/empty_road_network.gpkg my_map.gpkg
+```
+
+#### 4. Python Package for Map Creation
+
+Provide a Python utility for creating maps:
+
+```python
+#!/usr/bin/env python3
+"""maliput_geopackage.create - Create maliput GeoPackage files."""
+
+import sqlite3
+from pathlib import Path
+
+SCHEMA_SQL = """
+-- (complete schema here)
+"""
+
+def create_geopackage(filepath: str, metadata: dict = None) -> None:
+    """Create a new maliput GeoPackage with the standard schema.
+    
+    Args:
+        filepath: Path for the new .gpkg file
+        metadata: Optional dict of metadata key-value pairs
+    """
+    conn = sqlite3.connect(filepath)
+    conn.executescript(SCHEMA_SQL)
+    
+    if metadata:
+        for key, value in metadata.items():
+            conn.execute(
+                "INSERT OR REPLACE INTO maliput_metadata (key, value) VALUES (?, ?)",
+                (key, str(value))
+            )
+    
+    conn.commit()
+    conn.close()
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Create empty maliput GeoPackage")
+    parser.add_argument("output", help="Output .gpkg filepath")
+    args = parser.parse_args()
+    
+    create_geopackage(args.output)
+    print(f"Created: {args.output}")
+```
+
+### Versioning the Schema
+
+Include a schema version in metadata:
+
+```sql
+INSERT INTO maliput_metadata (key, value) VALUES ('schema_version', '1.0');
+```
+
+Check compatibility at load time:
+
+```cpp
+std::string version = QueryMetadata(db, "schema_version");
+if (version != SUPPORTED_SCHEMA_VERSION) {
+    throw std::runtime_error("Unsupported schema version: " + version);
+}
+```
+
+### Documentation Publishing
+
+1. **README in package**: Quick start guide
+2. **This document**: Full schema reference (install to `share/doc/`)
+3. **Online docs**: Host on GitHub Pages or Read the Docs
+4. **JSON Schema**: For validation tooling (optional)
+
+```cmake
+install(
+    FILES 
+        docs/geopackage_schema.md
+        docs/partial_loading.md
+    DESTINATION share/doc/${PROJECT_NAME}
+)
+```
