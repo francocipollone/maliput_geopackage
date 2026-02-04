@@ -54,7 +54,7 @@ class RoadNetworkLoader : public maliput::plugin::RoadNetworkLoader {
 
 }  // namespace
 
-REGISTER_ROAD_NETWORK_LOADER_PLUGIN("maliput_geopackage", RoadNetworkLoader);
+REGISTER_ROAD_NETWORK_LOADER_PLUGIN("poc_maliput_geopackage", RoadNetworkLoader);
 
 }  // namespace plugin
 }  // namespace maliput_geopackage
