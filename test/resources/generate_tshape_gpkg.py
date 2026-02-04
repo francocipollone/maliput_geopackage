@@ -75,7 +75,15 @@ def create_schema(conn):
         )
     ''')
 
-    # Lanes table (geometry stored as WKT text for simplicity)
+    # Boundaries table (canonical geometry for shared lane boundaries)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS boundaries (
+            boundary_id TEXT PRIMARY KEY,
+            geometry TEXT NOT NULL
+        )
+    ''')
+
+    # Lanes table (references boundaries by id)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS lanes (
             lane_id TEXT PRIMARY KEY,
@@ -85,10 +93,12 @@ def create_schema(conn):
             speed_limit_mps REAL,
             left_boundary_type TEXT DEFAULT 'solid_white',
             right_boundary_type TEXT DEFAULT 'dashed_white',
-            left_boundary TEXT NOT NULL,
-            right_boundary TEXT NOT NULL,
+            left_boundary_id TEXT NOT NULL,
+            right_boundary_id TEXT NOT NULL,
             centerline TEXT,
-            FOREIGN KEY (segment_id) REFERENCES segments(segment_id)
+            FOREIGN KEY (segment_id) REFERENCES segments(segment_id),
+            FOREIGN KEY (left_boundary_id) REFERENCES boundaries(boundary_id),
+            FOREIGN KEY (right_boundary_id) REFERENCES boundaries(boundary_id)
         )
     ''')
 
@@ -181,6 +191,24 @@ def populate_tshape_road(conn):
     """
     cursor = conn.cursor()
 
+    # Cache to avoid inserting duplicate boundaries for identical geometries.
+    boundary_cache = {}
+
+    def insert_boundary_for_lane(cursor, lane_id, side, geometry):
+        """Insert a canonical boundary if the geometry is new and return its id.
+
+        If an identical geometry was inserted previously, reuse its `boundary_id` so
+        adjacent lanes that share boundaries reference the same boundary row.
+        """
+        existing = boundary_cache.get(geometry)
+        if existing:
+            return existing
+        # Generate a compact deterministic id based on current cache size.
+        boundary_id = f"boundary_{len(boundary_cache) + 1}"
+        cursor.execute('INSERT INTO boundaries (boundary_id, geometry) VALUES (?, ?)', (boundary_id, geometry))
+        boundary_cache[geometry] = boundary_id
+        return boundary_id
+
     LANE_WIDTH = 3.5
     HALF_LANE = LANE_WIDTH / 2  # 1.75
     
@@ -244,21 +272,27 @@ def populate_tshape_road(conn):
     west_l2_right = generate_linestring_z(sample_line(0, -LANE_WIDTH, WEST_END, -LANE_WIDTH))
     west_l2_center = generate_linestring_z(sample_line(0, -HALF_LANE, WEST_END, -HALF_LANE))
 
-    cursor.execute('''
-        INSERT INTO lanes (lane_id, segment_id, lane_type, direction, speed_limit_mps,
-                           left_boundary_type, right_boundary_type,
-                           left_boundary, right_boundary, centerline)
-        VALUES ('west_l1', 'j_west_s1', 'driving', 'backward', 17.88,
-                'solid_white', 'solid_yellow', ?, ?, ?)
-    ''', (west_l1_left, west_l1_right, west_l1_center))
+    b_west_l1_left = insert_boundary_for_lane(cursor, 'west_l1', 'left', west_l1_left)
+    b_west_l1_right = insert_boundary_for_lane(cursor, 'west_l1', 'right', west_l1_right)
 
     cursor.execute('''
         INSERT INTO lanes (lane_id, segment_id, lane_type, direction, speed_limit_mps,
                            left_boundary_type, right_boundary_type,
-                           left_boundary, right_boundary, centerline)
+                           left_boundary_id, right_boundary_id, centerline)
+        VALUES ('west_l1', 'j_west_s1', 'driving', 'backward', 17.88,
+                'solid_white', 'solid_yellow', ?, ?, ?)
+    ''', (b_west_l1_left, b_west_l1_right, west_l1_center))
+
+    b_west_l2_left = insert_boundary_for_lane(cursor, 'west_l2', 'left', west_l2_left)
+    b_west_l2_right = insert_boundary_for_lane(cursor, 'west_l2', 'right', west_l2_right)
+
+    cursor.execute('''
+        INSERT INTO lanes (lane_id, segment_id, lane_type, direction, speed_limit_mps,
+                           left_boundary_type, right_boundary_type,
+                           left_boundary_id, right_boundary_id, centerline)
         VALUES ('west_l2', 'j_west_s1', 'driving', 'forward', 17.88,
                 'solid_yellow', 'solid_white', ?, ?, ?)
-    ''', (west_l2_left, west_l2_right, west_l2_center))
+    ''', (b_west_l2_left, b_west_l2_right, west_l2_center))
 
     # =====================================================
     # EAST ROAD LANES (x: 54 to 100, centerline at y=0)
@@ -272,21 +306,27 @@ def populate_tshape_road(conn):
     east_l2_right = generate_linestring_z(sample_line(EAST_START, -LANE_WIDTH, 100, -LANE_WIDTH))
     east_l2_center = generate_linestring_z(sample_line(EAST_START, -HALF_LANE, 100, -HALF_LANE))
 
-    cursor.execute('''
-        INSERT INTO lanes (lane_id, segment_id, lane_type, direction, speed_limit_mps,
-                           left_boundary_type, right_boundary_type,
-                           left_boundary, right_boundary, centerline)
-        VALUES ('east_l1', 'j_east_s1', 'driving', 'backward', 17.88,
-                'solid_white', 'solid_yellow', ?, ?, ?)
-    ''', (east_l1_left, east_l1_right, east_l1_center))
+    b_east_l1_left = insert_boundary_for_lane(cursor, 'east_l1', 'left', east_l1_left)
+    b_east_l1_right = insert_boundary_for_lane(cursor, 'east_l1', 'right', east_l1_right)
 
     cursor.execute('''
         INSERT INTO lanes (lane_id, segment_id, lane_type, direction, speed_limit_mps,
                            left_boundary_type, right_boundary_type,
-                           left_boundary, right_boundary, centerline)
+                           left_boundary_id, right_boundary_id, centerline)
+        VALUES ('east_l1', 'j_east_s1', 'driving', 'backward', 17.88,
+                'solid_white', 'solid_yellow', ?, ?, ?)
+    ''', (b_east_l1_left, b_east_l1_right, east_l1_center))
+
+    b_east_l2_left = insert_boundary_for_lane(cursor, 'east_l2', 'left', east_l2_left)
+    b_east_l2_right = insert_boundary_for_lane(cursor, 'east_l2', 'right', east_l2_right)
+
+    cursor.execute('''
+        INSERT INTO lanes (lane_id, segment_id, lane_type, direction, speed_limit_mps,
+                           left_boundary_type, right_boundary_type,
+                           left_boundary_id, right_boundary_id, centerline)
         VALUES ('east_l2', 'j_east_s1', 'driving', 'forward', 17.88,
                 'solid_yellow', 'solid_white', ?, ?, ?)
-    ''', (east_l2_left, east_l2_right, east_l2_center))
+    ''', (b_east_l2_left, b_east_l2_right, east_l2_center))
 
     # =====================================================
     # SOUTH ROAD LANES (centerline at x=50, y: -50 to -3.5)
@@ -309,21 +349,27 @@ def populate_tshape_road(conn):
     south_l2_right = generate_linestring_z(sample_line(SOUTH_CENTER_X, SOUTH_START_Y, SOUTH_CENTER_X, SOUTH_END))
     south_l2_center = generate_linestring_z(sample_line(SOUTH_CENTER_X - HALF_LANE, SOUTH_START_Y, SOUTH_CENTER_X - HALF_LANE, SOUTH_END))
 
-    cursor.execute('''
-        INSERT INTO lanes (lane_id, segment_id, lane_type, direction, speed_limit_mps,
-                           left_boundary_type, right_boundary_type,
-                           left_boundary, right_boundary, centerline)
-        VALUES ('south_l1', 'j_south_s1', 'driving', 'forward', 17.88,
-                'solid_yellow', 'solid_white', ?, ?, ?)
-    ''', (south_l1_left, south_l1_right, south_l1_center))
+    b_south_l1_left = insert_boundary_for_lane(cursor, 'south_l1', 'left', south_l1_left)
+    b_south_l1_right = insert_boundary_for_lane(cursor, 'south_l1', 'right', south_l1_right)
 
     cursor.execute('''
         INSERT INTO lanes (lane_id, segment_id, lane_type, direction, speed_limit_mps,
                            left_boundary_type, right_boundary_type,
-                           left_boundary, right_boundary, centerline)
+                           left_boundary_id, right_boundary_id, centerline)
+        VALUES ('south_l1', 'j_south_s1', 'driving', 'forward', 17.88,
+                'solid_yellow', 'solid_white', ?, ?, ?)
+    ''', (b_south_l1_left, b_south_l1_right, south_l1_center))
+
+    b_south_l2_left = insert_boundary_for_lane(cursor, 'south_l2', 'left', south_l2_left)
+    b_south_l2_right = insert_boundary_for_lane(cursor, 'south_l2', 'right', south_l2_right)
+
+    cursor.execute('''
+        INSERT INTO lanes (lane_id, segment_id, lane_type, direction, speed_limit_mps,
+                           left_boundary_type, right_boundary_type,
+                           left_boundary_id, right_boundary_id, centerline)
         VALUES ('south_l2', 'j_south_s1', 'driving', 'backward', 17.88,
                 'solid_white', 'solid_yellow', ?, ?, ?)
-    ''', (south_l2_left, south_l2_right, south_l2_center))
+    ''', (b_south_l2_left, b_south_l2_right, south_l2_center))
 
     # =====================================================
     # JUNCTION - STRAIGHT LANES (West <-> East)
@@ -334,25 +380,31 @@ def populate_tshape_road(conn):
     int_straight_l1_right = generate_linestring_z(sample_line(WEST_END, 0, EAST_START, 0, 5))
     int_straight_l1_center = generate_linestring_z(sample_line(WEST_END, HALF_LANE, EAST_START, HALF_LANE, 5))
 
+    b_int_straight_l1_left = insert_boundary_for_lane(cursor, 'int_straight_l1', 'left', int_straight_l1_left)
+    b_int_straight_l1_right = insert_boundary_for_lane(cursor, 'int_straight_l1', 'right', int_straight_l1_right)
+
     cursor.execute('''
         INSERT INTO lanes (lane_id, segment_id, lane_type, direction, speed_limit_mps,
                            left_boundary_type, right_boundary_type,
-                           left_boundary, right_boundary, centerline)
+                           left_boundary_id, right_boundary_id, centerline)
         VALUES ('int_straight_l1', 'j_int_straight', 'driving', 'backward', 17.88,
                 'none', 'none', ?, ?, ?)
-    ''', (int_straight_l1_left, int_straight_l1_right, int_straight_l1_center))
+    ''', (b_int_straight_l1_left, b_int_straight_l1_right, int_straight_l1_center))
 
     int_straight_l2_left = generate_linestring_z(sample_line(WEST_END, 0, EAST_START, 0, 5))
     int_straight_l2_right = generate_linestring_z(sample_line(WEST_END, -LANE_WIDTH, EAST_START, -LANE_WIDTH, 5))
     int_straight_l2_center = generate_linestring_z(sample_line(WEST_END, -HALF_LANE, EAST_START, -HALF_LANE, 5))
 
+    b_int_straight_l2_left = insert_boundary_for_lane(cursor, 'int_straight_l2', 'left', int_straight_l2_left)
+    b_int_straight_l2_right = insert_boundary_for_lane(cursor, 'int_straight_l2', 'right', int_straight_l2_right)
+
     cursor.execute('''
         INSERT INTO lanes (lane_id, segment_id, lane_type, direction, speed_limit_mps,
                            left_boundary_type, right_boundary_type,
-                           left_boundary, right_boundary, centerline)
+                           left_boundary_id, right_boundary_id, centerline)
         VALUES ('int_straight_l2', 'j_int_straight', 'driving', 'forward', 17.88,
                 'none', 'none', ?, ?, ?)
-    ''', (int_straight_l2_left, int_straight_l2_right, int_straight_l2_center))
+    ''', (b_int_straight_l2_left, b_int_straight_l2_right, int_straight_l2_center))
 
     # =====================================================
     # JUNCTION - TURN LANES (South <-> East)
@@ -383,15 +435,20 @@ def populate_tshape_road(conn):
     turn_se_right_pts = sample_arc(turn_se_center[0], turn_se_center[1], turn_se_radius - HALF_LANE, 
                                     math.pi, math.pi/2, 8)
 
+    turn_se_left_wkt = generate_linestring_z(turn_se_left_pts)
+    turn_se_right_wkt = generate_linestring_z(turn_se_right_pts)
+    turn_se_center_wkt = generate_linestring_z(turn_se_center_pts)
+
+    b_int_south_east_left = insert_boundary_for_lane(cursor, 'int_south_east', 'left', turn_se_left_wkt)
+    b_int_south_east_right = insert_boundary_for_lane(cursor, 'int_south_east', 'right', turn_se_right_wkt)
+
     cursor.execute('''
         INSERT INTO lanes (lane_id, segment_id, lane_type, direction, speed_limit_mps,
                            left_boundary_type, right_boundary_type,
-                           left_boundary, right_boundary, centerline)
+                           left_boundary_id, right_boundary_id, centerline)
         VALUES ('int_south_east', 'j_int_south_east', 'driving', 'forward', 17.88,
                 'none', 'none', ?, ?, ?)
-    ''', (generate_linestring_z(turn_se_left_pts),
-          generate_linestring_z(turn_se_right_pts),
-          generate_linestring_z(turn_se_center_pts)))
+    ''', (b_int_south_east_left, b_int_south_east_right, turn_se_center_wkt))
 
     # East->South turn (left turn for east_l1 -> south_l2)
     # east_l1 starts at (54, 1.75) going West
@@ -401,15 +458,20 @@ def populate_tshape_road(conn):
     turn_es_left_pts = sample_line(EAST_START, 0, SOUTH_CENTER_X, SOUTH_END, 8)
     turn_es_right_pts = sample_line(EAST_START, LANE_WIDTH, SOUTH_CENTER_X - LANE_WIDTH, SOUTH_END, 8)
 
+    turn_es_left_wkt = generate_linestring_z(turn_es_left_pts)
+    turn_es_right_wkt = generate_linestring_z(turn_es_right_pts)
+    turn_es_center_wkt = generate_linestring_z(turn_es_center_pts)
+
+    b_int_east_south_left = insert_boundary_for_lane(cursor, 'int_east_south', 'left', turn_es_left_wkt)
+    b_int_east_south_right = insert_boundary_for_lane(cursor, 'int_east_south', 'right', turn_es_right_wkt)
+
     cursor.execute('''
         INSERT INTO lanes (lane_id, segment_id, lane_type, direction, speed_limit_mps,
                            left_boundary_type, right_boundary_type,
-                           left_boundary, right_boundary, centerline)
+                           left_boundary_id, right_boundary_id, centerline)
         VALUES ('int_east_south', 'j_int_east_south', 'driving', 'backward', 17.88,
                 'none', 'none', ?, ?, ?)
-    ''', (generate_linestring_z(turn_es_left_pts),
-          generate_linestring_z(turn_es_right_pts),
-          generate_linestring_z(turn_es_center_pts)))
+    ''', (b_int_east_south_left, b_int_east_south_right, turn_es_center_wkt))
 
     # =====================================================
     # JUNCTION - TURN LANES (West <-> South)
@@ -441,15 +503,20 @@ def populate_tshape_road(conn):
     turn_ws_right_pts = sample_arc(turn_ws_center[0], turn_ws_center[1], turn_ws_radius + HALF_LANE, 
                                     math.pi/2, 0, 8)
 
+    turn_ws_left_wkt = generate_linestring_z(turn_ws_left_pts)
+    turn_ws_right_wkt = generate_linestring_z(turn_ws_right_pts)
+    turn_ws_center_wkt = generate_linestring_z(turn_ws_center_pts)
+
+    b_int_west_south_left = insert_boundary_for_lane(cursor, 'int_west_south', 'left', turn_ws_left_wkt)
+    b_int_west_south_right = insert_boundary_for_lane(cursor, 'int_west_south', 'right', turn_ws_right_wkt)
+
     cursor.execute('''
         INSERT INTO lanes (lane_id, segment_id, lane_type, direction, speed_limit_mps,
                            left_boundary_type, right_boundary_type,
-                           left_boundary, right_boundary, centerline)
+                           left_boundary_id, right_boundary_id, centerline)
         VALUES ('int_west_south', 'j_int_west_south', 'driving', 'forward', 17.88,
                 'none', 'none', ?, ?, ?)
-    ''', (generate_linestring_z(turn_ws_left_pts),
-          generate_linestring_z(turn_ws_right_pts),
-          generate_linestring_z(turn_ws_center_pts)))
+    ''', (b_int_west_south_left, b_int_west_south_right, turn_ws_center_wkt))
 
     # South->West turn (left turn for south_l1 -> west_l1)
     # south_l1 ends at (51.75, -3.5), west_l1 starts at (46, 1.75)
@@ -458,15 +525,20 @@ def populate_tshape_road(conn):
     turn_sw_left_pts = sample_line(SOUTH_CENTER_X + LANE_WIDTH, SOUTH_END, WEST_END, 0, 8)
     turn_sw_right_pts = sample_line(SOUTH_CENTER_X, SOUTH_END, WEST_END, LANE_WIDTH, 8)
 
+    turn_sw_left_wkt = generate_linestring_z(turn_sw_left_pts)
+    turn_sw_right_wkt = generate_linestring_z(turn_sw_right_pts)
+    turn_sw_center_wkt = generate_linestring_z(turn_sw_center_pts)
+
+    b_int_south_west_left = insert_boundary_for_lane(cursor, 'int_south_west', 'left', turn_sw_left_wkt)
+    b_int_south_west_right = insert_boundary_for_lane(cursor, 'int_south_west', 'right', turn_sw_right_wkt)
+
     cursor.execute('''
         INSERT INTO lanes (lane_id, segment_id, lane_type, direction, speed_limit_mps,
                            left_boundary_type, right_boundary_type,
-                           left_boundary, right_boundary, centerline)
+                           left_boundary_id, right_boundary_id, centerline)
         VALUES ('int_south_west', 'j_int_south_west', 'driving', 'backward', 17.88,
                 'none', 'none', ?, ?, ?)
-    ''', (generate_linestring_z(turn_sw_left_pts),
-          generate_linestring_z(turn_sw_right_pts),
-          generate_linestring_z(turn_sw_center_pts)))
+    ''', (b_int_south_west_left, b_int_south_west_right, turn_sw_center_wkt))
 
     # =====================================================
     # BRANCH POINTS
@@ -587,6 +659,8 @@ def main():
         print(f"  - Junctions: {cursor.fetchone()[0]}")
         cursor.execute("SELECT COUNT(*) FROM segments")
         print(f"  - Segments: {cursor.fetchone()[0]}")
+        cursor.execute("SELECT COUNT(*) FROM boundaries")
+        print(f"  - Boundaries: {cursor.fetchone()[0]}")
         cursor.execute("SELECT COUNT(*) FROM lanes")
         print(f"  - Lanes: {cursor.fetchone()[0]}")
         cursor.execute("SELECT COUNT(*) FROM branch_points")

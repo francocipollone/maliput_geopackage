@@ -40,6 +40,7 @@
 #include <maliput_sparse/parser/lane.h>
 #include <maliput_sparse/parser/parser.h>
 #include <maliput_sparse/parser/segment.h>
+#include <sqlite3.h>
 
 // Forward declaration for SQLite
 struct sqlite3;
@@ -51,7 +52,8 @@ namespace geopackage {
 /// maliput GeoPackage schema, and providing accessors to get the road network data.
 ///
 /// The GeoPackage must conform to the maliput_geopackage schema which includes:
-/// - lanes table with left_boundary and right_boundary LINESTRINGZ geometries
+/// - boundaries table (boundary_id, geometry) containing WKT LINESTRINGZ geometries
+/// - lanes table referencing boundaries by `left_boundary_id` and `right_boundary_id` (both required)
 /// - junctions table
 /// - segments table
 /// - branch_points table

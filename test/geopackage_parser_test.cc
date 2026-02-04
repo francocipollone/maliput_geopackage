@@ -4,8 +4,10 @@
 // All rights reserved.
 #include "maliput_geopackage/geopackage/geopackage_parser.h"
 
+#include <chrono>
 #include <string>
 
+#include <filesystem>
 #include <gtest/gtest.h>
 
 namespace maliput_geopackage {
@@ -92,6 +94,82 @@ TEST_F(GeoPackageParserTest, ConnectionsAreCreated) {
   // This test verifies the connection parsing doesn't crash and returns
   // a valid (possibly empty) list.
   EXPECT_GE(connections.size(), 0u);
+}
+
+TEST_F(GeoPackageParserTest, LoadBoundariesTable) {
+  // Create a temporary GeoPackage-like sqlite db file path in the system temp directory
+  const std::filesystem::path tmp_dir = std::filesystem::temp_directory_path();
+  const auto unique_suffix =
+      std::to_string(static_cast<long long>(std::chrono::steady_clock::now().time_since_epoch().count()));
+  const std::string tmpname = (tmp_dir / ("test_boundaries_" + unique_suffix + ".gpkg")).string();
+
+  sqlite3* db = nullptr;
+  ASSERT_EQ(sqlite3_open_v2(tmpname.c_str(), &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr), SQLITE_OK);
+
+  const char* sqls = R"SQL(
+      CREATE TABLE junctions (junction_id TEXT PRIMARY KEY, name TEXT);
+      CREATE TABLE segments (segment_id TEXT PRIMARY KEY, junction_id TEXT, name TEXT);
+      CREATE TABLE boundaries (boundary_id TEXT PRIMARY KEY, geometry TEXT);
+      CREATE TABLE lanes (
+          lane_id TEXT PRIMARY KEY,
+          segment_id TEXT,
+          lane_type TEXT,
+          direction TEXT,
+          left_boundary_id TEXT,
+          right_boundary_id TEXT
+      );
+
+      INSERT INTO junctions(junction_id, name) VALUES('j1', 'J1');
+      INSERT INTO segments(segment_id, junction_id, name) VALUES('j1_s1', 'j1', 'seg');
+      INSERT INTO boundaries(boundary_id, geometry) VALUES('br', 'LINESTRINGZ(0 0 0,100 0 0)');
+      INSERT INTO boundaries(boundary_id, geometry) VALUES('bb', 'LINESTRINGZ(0 3.5 0,100 3.5 0)');
+      INSERT INTO boundaries(boundary_id, geometry) VALUES('bl', 'LINESTRINGZ(0 7.0 0,100 7.0 0)');
+
+      INSERT INTO lanes (lane_id, segment_id, lane_type, direction, left_boundary_id, right_boundary_id)
+        VALUES ('j1_s1_lane1','j1_s1','driving','forward','bb','br');
+
+      INSERT INTO lanes (lane_id, segment_id, lane_type, direction, left_boundary_id, right_boundary_id)
+        VALUES ('j1_s1_lane2','j1_s1','driving','backward','bl','bb');
+  )SQL";
+
+  char* errmsg = nullptr;
+  int rc = sqlite3_exec(db, sqls, nullptr, nullptr, &errmsg);
+  if (rc != SQLITE_OK) {
+    sqlite3_close(db);
+    std::remove(tmpname.c_str());
+    FAIL() << (errmsg ? errmsg : "sqlite error");
+  }
+  sqlite3_close(db);
+
+  // Parse the temporary file
+  GeoPackageParser parser(tmpname);
+  const auto& junctions = parser.GetJunctions();
+  ASSERT_EQ(junctions.size(), 1u);
+
+  auto jt = junctions.find("j1");
+  ASSERT_NE(jt, junctions.end());
+  auto segit = jt->second.segments.find("j1_s1");
+  ASSERT_NE(segit, jt->second.segments.end());
+  const auto& segment = segit->second;
+  ASSERT_EQ(segment.lanes.size(), 2u);
+
+  const maliput_sparse::parser::Lane* lane1 = nullptr;
+  const maliput_sparse::parser::Lane* lane2 = nullptr;
+  for (const auto& ln : segment.lanes) {
+    if (ln.id == "j1_s1_lane1") lane1 = &ln;
+    if (ln.id == "j1_s1_lane2") lane2 = &ln;
+  }
+  ASSERT_NE(lane1, nullptr);
+  ASSERT_NE(lane2, nullptr);
+
+  // Validate boundary coordinates were parsed from the shared boundaries
+  EXPECT_DOUBLE_EQ(lane1->left.first().y(), 3.5);
+  EXPECT_DOUBLE_EQ(lane1->right.first().y(), 0.0);
+  EXPECT_DOUBLE_EQ(lane2->left.first().y(), 7.0);
+  EXPECT_DOUBLE_EQ(lane2->right.first().y(), 3.5);
+
+  // cleanup
+  std::remove(tmpname.c_str());
 }
 
 TEST_F(GeoPackageParserTest, NonExistentFileThrows) {
