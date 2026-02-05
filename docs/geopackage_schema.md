@@ -78,17 +78,26 @@ CREATE TABLE segments (
 
 #### `lanes`
 
-Defines lanes with their geometric boundaries. Each lane has left and right boundaries stored as 3D LineStrings.
+Defines lanes which reference left and right boundary geometries stored in the `boundaries` table. Boundaries are shared 3D LineStrings (WKT LINESTRINGZ) that can be reused across multiple lanes to avoid duplication.
 
 ```sql
+-- Boundaries table: shared LINESTRINGZ geometries referenced by lanes
+CREATE TABLE IF NOT EXISTS boundaries (
+    boundary_id TEXT PRIMARY KEY,
+    geometry TEXT NOT NULL  -- WKT LINESTRINGZ(x1 y1 z1, x2 y2 z2, ...)
+);
+
+-- Lanes now reference boundary IDs instead of storing WKT directly
 CREATE TABLE lanes (
     lane_id TEXT PRIMARY KEY,
     segment_id TEXT NOT NULL,
     lane_type TEXT DEFAULT 'driving',
     direction TEXT DEFAULT 'forward',
-    left_boundary TEXT NOT NULL,  -- WKT LINESTRINGZ
-    right_boundary TEXT NOT NULL, -- WKT LINESTRINGZ
+    left_boundary_id TEXT NOT NULL,   -- FOREIGN KEY -> boundaries(boundary_id)
+    right_boundary_id TEXT NOT NULL,  -- FOREIGN KEY -> boundaries(boundary_id)
     FOREIGN KEY (segment_id) REFERENCES segments(segment_id)
+    FOREIGN KEY (left_boundary_id) REFERENCES boundaries(boundary_id),
+    FOREIGN KEY (right_boundary_id) REFERENCES boundaries(boundary_id)
 );
 ```
 
@@ -98,8 +107,10 @@ CREATE TABLE lanes (
 | `segment_id` | TEXT | Parent segment ID |
 | `lane_type` | TEXT | Lane type: `driving`, `shoulder`, `parking`, etc. |
 | `direction` | TEXT | Travel direction: `forward`, `backward`, `bidirectional` |
-| `left_boundary` | TEXT | Left boundary as WKT LINESTRINGZ |
-| `right_boundary` | TEXT | Right boundary as WKT LINESTRINGZ |
+| `left_boundary_id` | TEXT | Reference to a `boundaries.boundary_id` containing the left boundary WKT LINESTRINGZ |
+| `right_boundary_id` | TEXT | Reference to a `boundaries.boundary_id` containing the right boundary WKT LINESTRINGZ |
+
+**Note:** For backwards compatibility some GeoPackages may still include `left_boundary` and `right_boundary` WKT columns; both formats are supported by the parser.
 
 **Geometry Format:**
 
@@ -110,6 +121,137 @@ LINESTRINGZ(x1 y1 z1, x2 y2 z2, x3 y3 z3, ...)
 ```
 
 The coordinates represent points in the inertial frame (typically ENU - East-North-Up).
+#### `boundaries`
+
+Stores shared boundary geometries as WKT LINESTRINGZ. These are referenced from `lanes` by ID to avoid duplicating identical boundary geometry when adjacent lanes share a common edge.
+
+```sql
+CREATE TABLE IF NOT EXISTS boundaries (
+    boundary_id TEXT PRIMARY KEY,
+    geometry TEXT NOT NULL  -- WKT LINESTRINGZ(x1 y1 z1, x2 y2 z2, ...)
+);
+```
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `boundary_id` | TEXT | Unique identifier for the boundary |
+| `geometry` | TEXT | WKT LINESTRINGZ geometry string |
+
+**Geometry Format:**
+
+Boundaries are stored as Well-Known Text (WKT) 3D LineStrings:
+
+```
+LINESTRINGZ(x1 y1 z1, x2 y2 z2, x3 y3 z3, ...)
+```
+
+The coordinates represent points in the inertial frame (typically ENU - East-North-Up).
+
+---
+
+#### `lanes`
+
+Defines lanes which reference left and right boundary geometries stored in the `boundaries` table.
+
+```sql
+CREATE TABLE lanes (
+    lane_id TEXT PRIMARY KEY,
+    segment_id TEXT NOT NULL,
+    lane_type TEXT DEFAULT 'driving',
+    direction TEXT DEFAULT 'forward',
+    left_boundary_id TEXT NOT NULL,
+    left_inverted BOOLEAN DEFAULT FALSE,
+    right_boundary_id TEXT NOT NULL,
+    right_inverted BOOLEAN DEFAULT FALSE,
+    FOREIGN KEY (segment_id) REFERENCES segments(segment_id),
+    FOREIGN KEY (left_boundary_id) REFERENCES boundaries(boundary_id),
+    FOREIGN KEY (right_boundary_id) REFERENCES boundaries(boundary_id)
+);
+```
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `lane_id` | TEXT | Unique identifier for the lane |
+| `segment_id` | TEXT | Parent segment ID |
+| `lane_type` | TEXT | Lane type: `driving`, `shoulder`, `parking`, etc. |
+| `direction` | TEXT | Travel direction: `forward`, `backward`, `bidirectional` |
+| `left_boundary_id` | TEXT | Reference to a `boundaries.boundary_id` |
+| `left_inverted` | BOOLEAN | If TRUE, iterate left boundary points in reverse order |
+| `right_boundary_id` | TEXT | Reference to a `boundaries.boundary_id` |
+| `right_inverted` | BOOLEAN | If TRUE, iterate right boundary points in reverse order |
+
+**Note:** For backwards compatibility some GeoPackages may still include `left_boundary` and `right_boundary` WKT columns; both formats are supported by the parser.
+
+---
+
+##### Boundary Inversion Flags: Rationale
+
+The `left_inverted` and `right_inverted` flags solve a critical problem when working with boundary geometries from various sources (GIS tools, automated extraction, format conversions like Lanelet2).
+
+**The Problem:**
+
+Boundary geometries may be stored with inconsistent point ordering. For example, when drawing lanes in a GIS tool, a user might draw:
+- Left boundary from south to north
+- Right boundary from north to south
+
+This results in "twisted" lane geometry where the boundaries cross each other, which is geometrically invalid.
+
+```
+❌ WITHOUT inversion flags - Twisted lane:
+
+  Left:   L1 -----> L2 -----> L3      (points go left-to-right)
+  Right:  R3 <----- R2 <----- R1      (points go right-to-left)
+  
+  At "start": Left is at x=0, Right is at x=100 → INVALID
+```
+
+**The Solution:**
+
+The inversion flags allow boundaries to remain stored as-is while indicating how they should be interpreted:
+
+```
+✓ WITH inversion flags - Consistent lane:
+
+  Stored boundaries (unchanged):
+    Left (b1):  L1 → L2 → L3         (x=0 to x=100)
+    Right (b2): R3 → R2 → R1         (x=100 to x=0)
+  
+  Lane definition:
+    left_boundary_id = 'b1', left_inverted = FALSE
+    right_boundary_id = 'b2', right_inverted = TRUE   ← fixes orientation!
+  
+  After applying inversions:
+    Left:  L1 → L2 → L3   (x=0 to x=100)
+    Right: R1 → R2 → R3   (x=0 to x=100)  ✓ Consistent!
+```
+
+**Processing Order:**
+
+```
+Step 1: Get raw boundary points from storage
+        ↓
+Step 2: Apply per-boundary inversion flags (left_inverted, right_inverted)
+        → This makes both boundaries geometrically consistent
+        ↓
+Step 3: The `direction` field indicates travel semantics (forward/backward)
+        → This is metadata for routing, not geometry processing
+```
+
+**Benefits:**
+
+1. **Boundaries stay immutable** - no need to modify stored geometry
+2. **Maximum sharing** - same boundary can be used normally in one lane, inverted in another
+3. **Explicit** - clear what's happening, easy to debug
+4. **Source compatibility** - matches Lanelet2 semantics where inverted references are common
+
+**Relationship with `direction`:**
+
+| Field | Purpose | Affects |
+|-------|---------|---------|
+| `left_inverted` / `right_inverted` | **Geometric**: Make boundary points consistent | Point iteration order |
+| `direction` | **Semantic**: Which way does traffic flow? | Routing, s-coordinate direction |
+
+The inversion flags fix geometry; `direction` describes traffic semantics on that now-consistent geometry.
 
 ---
 
@@ -248,27 +390,32 @@ INSERT INTO junctions (junction_id, name) VALUES ('j1', 'Main Road Junction');
 -- Insert segment
 INSERT INTO segments (segment_id, junction_id, name) VALUES ('j1_s1', 'j1', 'Main Road Segment');
 
--- Insert lanes (100m straight road, 3.5m lane width each)
+-- Insert shared boundaries (100m straight road, 3.5m lane width each)
+INSERT INTO boundaries (boundary_id, geometry) VALUES ('b_right', 'LINESTRINGZ(0 0 0, 25 0 0, 50 0 0, 75 0 0, 100 0 0)');
+INSERT INTO boundaries (boundary_id, geometry) VALUES ('b_between', 'LINESTRINGZ(0 3.5 0, 25 3.5 0, 50 3.5 0, 75 3.5 0, 100 3.5 0)');
+INSERT INTO boundaries (boundary_id, geometry) VALUES ('b_left', 'LINESTRINGZ(0 7.0 0, 25 7.0 0, 50 7.0 0, 75 7.0 0, 100 7.0 0)');
+
+-- Insert lanes by referencing boundary IDs
 -- Lane 1: y = 0 to y = 3.5
-INSERT INTO lanes (lane_id, segment_id, lane_type, direction, left_boundary, right_boundary)
+INSERT INTO lanes (lane_id, segment_id, lane_type, direction, left_boundary_id, right_boundary_id)
 VALUES (
     'j1_s1_lane1',
     'j1_s1',
     'driving',
     'forward',
-    'LINESTRINGZ(0 3.5 0, 25 3.5 0, 50 3.5 0, 75 3.5 0, 100 3.5 0)',
-    'LINESTRINGZ(0 0 0, 25 0 0, 50 0 0, 75 0 0, 100 0 0)'
+    'b_between',
+    'b_right'
 );
 
 -- Lane 2: y = 3.5 to y = 7.0
-INSERT INTO lanes (lane_id, segment_id, lane_type, direction, left_boundary, right_boundary)
+INSERT INTO lanes (lane_id, segment_id, lane_type, direction, left_boundary_id, right_boundary_id)
 VALUES (
     'j1_s1_lane2',
     'j1_s1',
     'driving',
     'forward',
-    'LINESTRINGZ(0 7.0 0, 25 7.0 0, 50 7.0 0, 75 7.0 0, 100 7.0 0)',
-    'LINESTRINGZ(0 3.5 0, 25 3.5 0, 50 3.5 0, 75 3.5 0, 100 3.5 0)'
+    'b_left',
+    'b_between'
 );
 
 -- Define branch points
@@ -416,8 +563,18 @@ CREATE TABLE IF NOT EXISTS segments (
 );
 
 -- -----------------------------------------------------------------------------
+-- Boundaries Table
+-- Shared boundary geometries stored as WKT LINESTRINGZ. These are referenced
+-- from `lanes` by ID to avoid duplicating identical boundary geometry.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS boundaries (
+    boundary_id TEXT PRIMARY KEY,
+    geometry TEXT NOT NULL  -- WKT LINESTRINGZ(x1 y1 z1, x2 y2 z2, ...)
+);
+
+-- -----------------------------------------------------------------------------
 -- Lanes Table
--- Defines lanes with their geometric boundaries as WKT LINESTRINGZ
+-- Defines lanes referencing boundary IDs in `boundaries` table
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS lanes (
     lane_id TEXT PRIMARY KEY,
@@ -426,9 +583,13 @@ CREATE TABLE IF NOT EXISTS lanes (
         CHECK (lane_type IN ('driving', 'shoulder', 'parking', 'biking', 'sidewalk', 'restricted')),
     direction TEXT DEFAULT 'forward'
         CHECK (direction IN ('forward', 'backward', 'bidirectional')),
-    left_boundary TEXT NOT NULL,   -- WKT LINESTRINGZ(x1 y1 z1, x2 y2 z2, ...)
-    right_boundary TEXT NOT NULL,  -- WKT LINESTRINGZ(x1 y1 z1, x2 y2 z2, ...)
+    left_boundary_id TEXT NOT NULL,   -- FOREIGN KEY -> boundaries(boundary_id)
+    right_boundary_id TEXT NOT NULL,  -- FOREIGN KEY -> boundaries(boundary_id)
     FOREIGN KEY (segment_id) REFERENCES segments(segment_id)
+        ON DELETE CASCADE,
+    FOREIGN KEY (left_boundary_id) REFERENCES boundaries(boundary_id)
+        ON DELETE CASCADE,
+    FOREIGN KEY (right_boundary_id) REFERENCES boundaries(boundary_id)
         ON DELETE CASCADE
 );
 
@@ -513,8 +674,11 @@ INSERT INTO maliput_metadata (key, value) VALUES ('linear_tolerance', '0.01');
 ```sql
 -- Their road network data
 INSERT INTO junctions (junction_id, name) VALUES ('downtown', 'Downtown Area');
-INSERT INTO lanes (lane_id, segment_id, left_boundary, right_boundary)
-VALUES ('lane_1', 'seg_1', 'LINESTRINGZ(...)', 'LINESTRINGZ(...)');
+-- Using `boundaries` table for shared geometries
+INSERT INTO boundaries (boundary_id, geometry) VALUES ('b1', 'LINESTRINGZ(...)');
+INSERT INTO boundaries (boundary_id, geometry) VALUES ('b2', 'LINESTRINGZ(...)');
+INSERT INTO lanes (lane_id, segment_id, left_boundary_id, right_boundary_id)
+VALUES ('lane_1', 'seg_1', 'b2', 'b1');
 
 -- Override defaults if needed
 UPDATE maliput_metadata SET value = '0.001' WHERE key = 'linear_tolerance';

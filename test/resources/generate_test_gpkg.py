@@ -44,7 +44,15 @@ def create_schema(conn):
         )
     ''')
 
-    # Lanes table (geometry stored as WKT text for simplicity)
+    # Boundaries table (canonical geometry for shared lane boundaries)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS boundaries (
+            boundary_id TEXT PRIMARY KEY,
+            geometry TEXT NOT NULL
+        )
+    ''')
+
+    # Lanes table (references boundaries by id)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS lanes (
             lane_id TEXT PRIMARY KEY,
@@ -54,10 +62,12 @@ def create_schema(conn):
             speed_limit_mps REAL,
             left_boundary_type TEXT DEFAULT 'solid_white',
             right_boundary_type TEXT DEFAULT 'dashed_white',
-            left_boundary TEXT NOT NULL,
-            right_boundary TEXT NOT NULL,
+            left_boundary_id TEXT NOT NULL,
+            right_boundary_id TEXT NOT NULL,
             centerline TEXT,
-            FOREIGN KEY (segment_id) REFERENCES segments(segment_id)
+            FOREIGN KEY (segment_id) REFERENCES segments(segment_id),
+            FOREIGN KEY (left_boundary_id) REFERENCES boundaries(boundary_id),
+            FOREIGN KEY (right_boundary_id) REFERENCES boundaries(boundary_id)
         )
     ''')
 
@@ -116,6 +126,12 @@ def populate_two_lane_road(conn):
     """
     cursor = conn.cursor()
 
+    def insert_boundary_for_lane(cursor, lane_id, side, geometry):
+        """Insert a canonical boundary and return its generated id."""
+        boundary_id = f"{lane_id}_{side}_boundary"
+        cursor.execute('INSERT INTO boundaries (boundary_id, geometry) VALUES (?, ?)', (boundary_id, geometry))
+        return boundary_id
+
     # Insert metadata
     metadata = [
         ('schema_version', '1.0'),
@@ -138,26 +154,30 @@ def populate_two_lane_road(conn):
     lane1_right = 'LINESTRINGZ(0 0 0, 25 0 0, 50 0 0, 75 0 0, 100 0 0)'
     lane1_center = 'LINESTRINGZ(0 1.75 0, 25 1.75 0, 50 1.75 0, 75 1.75 0, 100 1.75 0)'
 
+    b_j1_s1_lane1_left = insert_boundary_for_lane(cursor, 'j1_s1_lane1', 'left', lane1_left)
+    b_j1_s1_lane1_right = insert_boundary_for_lane(cursor, 'j1_s1_lane1', 'right', lane1_right)
+
     cursor.execute('''
         INSERT INTO lanes (lane_id, segment_id, lane_type, direction, speed_limit_mps,
                            left_boundary_type, right_boundary_type,
-                           left_boundary, right_boundary, centerline)
+                           left_boundary_id, right_boundary_id, centerline)
         VALUES ('j1_s1_lane1', 'j1_s1', 'driving', 'forward', 13.89,
                 'solid_yellow', 'dashed_yellow', ?, ?, ?)
-    ''', (lane1_left, lane1_right, lane1_center))
+    ''', (b_j1_s1_lane1_left, b_j1_s1_lane1_right, lane1_center))
 
-    # Lane 2 (Backward direction, y: -3.5 to 0)
-    lane2_left = 'LINESTRINGZ(0 0 0, 25 0 0, 50 0 0, 75 0 0, 100 0 0)'
+    # Lane 2 (Backward direction, y: -3.5 to 0), shares lane boundary with lane 1
     lane2_right = 'LINESTRINGZ(0 -3.5 0, 25 -3.5 0, 50 -3.5 0, 75 -3.5 0, 100 -3.5 0)'
     lane2_center = 'LINESTRINGZ(0 -1.75 0, 25 -1.75 0, 50 -1.75 0, 75 -1.75 0, 100 -1.75 0)'
 
+    b_j1_s1_lane2_right = insert_boundary_for_lane(cursor, 'j1_s1_lane2', 'right', lane2_right)
+
     cursor.execute('''
         INSERT INTO lanes (lane_id, segment_id, lane_type, direction, speed_limit_mps,
                            left_boundary_type, right_boundary_type,
-                           left_boundary, right_boundary, centerline)
+                           left_boundary_id, right_boundary_id, centerline)
         VALUES ('j1_s1_lane2', 'j1_s1', 'driving', 'backward', 13.89,
                 'dashed_yellow', 'solid_yellow', ?, ?, ?)
-    ''', (lane2_left, lane2_right, lane2_center))
+    ''', (b_j1_s1_lane1_right, b_j1_s1_lane2_right, lane2_center))
 
     # Insert branch points
     cursor.execute("INSERT INTO branch_points (branch_point_id, location) VALUES ('bp_start', 'POINTZ(0 0 0)')")
@@ -211,6 +231,8 @@ def main():
         print(f"  - Junctions: {cursor.fetchone()[0]}")
         cursor.execute("SELECT COUNT(*) FROM segments")
         print(f"  - Segments: {cursor.fetchone()[0]}")
+        cursor.execute("SELECT COUNT(*) FROM boundaries")
+        print(f"  - Boundaries: {cursor.fetchone()[0]}")
         cursor.execute("SELECT COUNT(*) FROM lanes")
         print(f"  - Lanes: {cursor.fetchone()[0]}")
         cursor.execute("SELECT COUNT(*) FROM branch_points")

@@ -35,7 +35,6 @@
 
 #include <maliput/common/logger.h>
 #include <maliput_sparse/geometry/line_string.h>
-#include <sqlite3.h>
 
 #include "maliput_geopackage/geopackage/wkt_parser.h"
 
@@ -174,12 +173,39 @@ void GeoPackageParser::ParseSegmentsAndLanes() {
   }
   sqlite3_finalize(stmt);
 
-  // Now parse lanes with their geometries
-  // Note: We store geometry as WKT text for simplicity. In a production system,
-  // you might use SpatiaLite's AsText() function or parse WKB directly.
+  // Load `boundaries` table and require it for parsing lanes (new schema only)
+  std::unordered_map<std::string, maliput_sparse::geometry::LineString3d> boundaries_map;
+  {
+    const char* boundary_sql = "SELECT boundary_id, geometry FROM boundaries";
+    sqlite3_stmt* bstmt = nullptr;
+    if (sqlite3_prepare_v2(db_, boundary_sql, -1, &bstmt, nullptr) != SQLITE_OK) {
+      throw std::runtime_error("GeoPackage missing required 'boundaries' table: " + std::string(sqlite3_errmsg(db_)));
+    }
+
+    bool has_boundaries = false;
+    while (sqlite3_step(bstmt) == SQLITE_ROW) {
+      has_boundaries = true;
+      const char* boundary_id = reinterpret_cast<const char*>(sqlite3_column_text(bstmt, 0));
+      const char* geometry_wkt = reinterpret_cast<const char*>(sqlite3_column_text(bstmt, 1));
+      if (!boundary_id || !geometry_wkt) {
+        sqlite3_finalize(bstmt);
+        throw std::runtime_error("Invalid entry in 'boundaries' table: missing id or geometry");
+      }
+      const auto pts = ParseLineStringZ(geometry_wkt);
+      boundaries_map.emplace(boundary_id, ToLineString3d(pts));
+      maliput::log()->trace("Parsed boundary: ", boundary_id);
+    }
+
+    sqlite3_finalize(bstmt);
+
+    if (!has_boundaries) {
+      throw std::runtime_error("'boundaries' table exists but contains no rows; at least one boundary is required");
+    }
+  }
+
+  // Parse lanes by referencing boundary IDs. This parser requires the new schema.
   const char* lane_sql =
-      "SELECT lane_id, segment_id, lane_type, direction, "
-      "       left_boundary, right_boundary "
+      "SELECT lane_id, segment_id, lane_type, direction, left_boundary_id, right_boundary_id "
       "FROM lanes";
 
   if (sqlite3_prepare_v2(db_, lane_sql, -1, &stmt, nullptr) != SQLITE_OK) {
@@ -189,30 +215,30 @@ void GeoPackageParser::ParseSegmentsAndLanes() {
   while (sqlite3_step(stmt) == SQLITE_ROW) {
     const char* lane_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
     const char* segment_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-    // const char* lane_type = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
-    // const char* direction = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
-    const char* left_boundary_wkt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
-    const char* right_boundary_wkt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
+    const char* left_boundary_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
+    const char* right_boundary_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
 
-    if (!lane_id || !segment_id || !left_boundary_wkt || !right_boundary_wkt) {
-      maliput::log()->warn("Skipping lane with missing required fields");
-      continue;
+    if (!lane_id || !segment_id || !left_boundary_id || !right_boundary_id) {
+      sqlite3_finalize(stmt);
+      throw std::runtime_error(
+          "Lane row missing required fields (expected 'left_boundary_id' and 'right_boundary_id')");
     }
 
-    // Parse the WKT geometries
-    const auto left_points = ParseLineStringZ(left_boundary_wkt);
-    const auto right_points = ParseLineStringZ(right_boundary_wkt);
+    auto left_it = boundaries_map.find(left_boundary_id);
+    auto right_it = boundaries_map.find(right_boundary_id);
+    if (left_it == boundaries_map.end() || right_it == boundaries_map.end()) {
+      sqlite3_finalize(stmt);
+      throw std::runtime_error("Lane '" + std::string(lane_id) + "' references unknown boundary id(s)");
+    }
 
-    // Create the lane using aggregate initialization
-    // Lane struct has: id, left, right, left_lane_id, right_lane_id, successors, predecessors
     maliput_sparse::parser::Lane lane{
-        lane_id,                       // id
-        ToLineString3d(left_points),   // left
-        ToLineString3d(right_points),  // right
-        std::nullopt,                  // left_lane_id
-        std::nullopt,                  // right_lane_id
-        {},                            // successors
-        {}                             // predecessors
+        lane_id,           // id
+        left_it->second,   // left
+        right_it->second,  // right
+        std::nullopt,      // left_lane_id
+        std::nullopt,      // right_lane_id
+        {},                // successors
+        {}                 // predecessors
     };
 
     // Find the junction for this segment
@@ -232,7 +258,7 @@ void GeoPackageParser::ParseSegmentsAndLanes() {
         segment_it->second.lanes.push_back(lane);
         lane_to_junction_[lane_id] = junction_id;
         lane_to_segment_[lane_id] = segment_id;
-        maliput::log()->trace("Parsed lane: ", lane_id, " in segment: ", segment_id);
+        maliput::log()->trace("Parsed lane (via boundary ids): ", lane_id, " in segment: ", segment_id);
       }
     }
   }

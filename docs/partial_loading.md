@@ -51,10 +51,11 @@ WHERE s.junction_id = 'intersection_main_oak';
 Load all lanes within a geographic region:
 
 ```sql
--- With SpatiaLite extension
-SELECT * FROM lanes 
+-- With SpatiaLite extension and the new `boundaries` table
+SELECT l.* FROM lanes l
+JOIN boundaries b ON l.left_boundary_id = b.boundary_id
 WHERE MbrIntersects(
-    GeomFromText(left_boundary),
+    GeomFromText(b.geometry),
     BuildMbr(min_x, min_y, max_x, max_y)
 );
 ```
